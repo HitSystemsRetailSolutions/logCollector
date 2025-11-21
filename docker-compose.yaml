@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  apicultor:
+    container_name: logCollector
+    build: .
+    environment:
+      TZ: Europe/Madrid
+    ports:
+      - 2896:2896
+    volumes:
+      - ./nodes.yaml:/usr/src/nodes.yaml
+    restart: unless-stopped
