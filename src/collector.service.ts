@@ -3,6 +3,7 @@ import { ConfigService } from './config.service';
 import { Client, ClientChannel } from 'ssh2';
 import * as fs from 'fs';
 import axios from 'axios';
+import * as net from 'net';
 
 interface NodeConfig {
     job_name: string;
@@ -34,30 +35,35 @@ export class LogCollectorService implements OnApplicationBootstrap {
 
     async collectLogs() {
         const nodes: NodeConfig[] = this.configService.getNodes();
-        await Promise.all(nodes.map((node) => this.handleNode(node)));
+        nodes.forEach(node => this.handleNode(node));
     }
 
     private async handleNode(node: NodeConfig) {
         const target = node.static_configs[0].targets[0];
-        const labels = {
-            ...node.static_configs[0].labels,
-            nodo: node.job_name,
-        };
+        const labels = { ...node.static_configs[0].labels, nodo: node.job_name };
 
         this.logQueues[target] = [];
         this.logBuffers[target] = '';
 
         let retries = 0;
 
-        const connect = () => {
+        const connect = async () => {
+            const canConnect = await this.checkPort(target, 22);
+            if (!canConnect) {
+                this.logger.warn(`Node ${target} is offline, retrying in ${this.retryDelay / 1000}s...`);
+                setTimeout(connect, this.retryDelay);
+                return;
+            }
+
             const conn = new Client();
 
             conn.on('ready', () => {
-                this.startFlushInterval(target, labels);
+                this.logger.log(`Connected to ${target}`);
                 this.streamLogs(conn, target, labels);
+                this.startFlushInterval(target, labels);
             });
 
-            conn.on('error', (err) => {
+            conn.on('error', err => {
                 this.logger.error(`SSH error on ${target}: ${err.message}`);
                 if (retries < this.maxRetries) {
                     retries++;
@@ -68,10 +74,6 @@ export class LogCollectorService implements OnApplicationBootstrap {
             conn.on('end', () => {
                 this.logger.warn(`SSH connection ended for ${target}, reconnecting...`);
                 setTimeout(connect, this.retryDelay);
-            });
-
-            conn.on('close', () => {
-                conn.end();
             });
 
             conn.connect({
@@ -85,8 +87,26 @@ export class LogCollectorService implements OnApplicationBootstrap {
         connect();
     }
 
+    private checkPort(host: string, port: number, timeout = 2000): Promise<boolean> {
+        return new Promise(resolve => {
+            const socket = new net.Socket();
+            let isAvailable = false;
+
+            socket.setTimeout(timeout);
+            socket.on('connect', () => {
+                isAvailable = true;
+                socket.destroy();
+            });
+            socket.on('timeout', () => socket.destroy());
+            socket.on('error', () => { });
+            socket.on('close', () => resolve(isAvailable));
+
+            socket.connect(port, host);
+        });
+    }
+
     private startFlushInterval(host: string, labels: Record<string, string>) {
-        if (this.flushIntervals[host]) { clearInterval(this.flushIntervals[host]); }
+        if (this.flushIntervals[host]) return;
         this.flushIntervals[host] = setInterval(() => this.flushLogs(host, labels), this.batchInterval);
     }
 
@@ -101,14 +121,9 @@ export class LogCollectorService implements OnApplicationBootstrap {
                 this.logBuffers[host] += data.toString();
                 const lines = this.logBuffers[host].split('\n');
                 this.logBuffers[host] = lines.pop() || '';
+                if (lines.length > 0) this.logQueues[host].push(...lines);
 
-                if (lines.length > 0) {
-                    this.logQueues[host].push(...lines);
-
-                    if (this.logQueues[host].length >= this.batchSize) {
-                        this.flushLogs(host, labels);
-                    }
-                }
+                if (this.logQueues[host].length >= this.batchSize) this.flushLogs(host, labels);
             });
 
             stream.on('close', () => {
