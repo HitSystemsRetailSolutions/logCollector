@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as yaml from 'js-yaml';
 
 export class ConfigService {
-    private filePath = './nodes.yaml';
+    private filePath = '/usr/src/config/nodes.yaml';
 
     getNodes() {
         const file = fs.readFileSync(this.filePath, 'utf8');

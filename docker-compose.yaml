@@ -1,6 +1,6 @@
 version: '3.8'
 services:
-  apicultor:
+  logcollector:
     container_name: logCollector
     build: .
     environment:
@@ -8,5 +8,6 @@ services:
     ports:
       - 2896:2896
     volumes:
-      - ./nodes.yaml:/usr/src/nodes.yaml
+      - ./config/nodes.yaml:/usr/src/config/nodes.yaml
+      - ./config/tpv_rsa.pem:/usr/src/ssh/tpv_rsa.pem:ro
     restart: unless-stopped

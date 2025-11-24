@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { ConfigService } from './config.service';
 import { Client, ClientChannel } from 'ssh2';
 import * as fs from 'fs';
@@ -13,16 +13,17 @@ interface NodeConfig {
 }
 
 @Injectable()
-export class LogCollectorService {
+export class LogCollectorService implements OnApplicationBootstrap {
     private readonly logger = new Logger(LogCollectorService.name);
 
     private readonly maxRetries = 5;
-    private readonly retryDelay = 5000; // ms
-    private readonly batchSize = 50; // líneas por batch
-    private readonly batchInterval = 2000; // enviar batch cada 2 segundos
+    private readonly retryDelay = 5000;
+    private readonly batchSize = 50;
+    private readonly batchInterval = 2000;
 
-    private logQueues: Record<string, string[]> = {}; // cola de logs por nodo
-    private flushIntervals: Record<string, NodeJS.Timeout> = {}; // intervalos por nodo
+    private logQueues: Record<string, string[]> = {};
+    private flushIntervals: Record<string, NodeJS.Timeout> = {};
+    private logBuffers: Record<string, string> = {};
 
     constructor(private readonly configService: ConfigService) { }
 
@@ -38,10 +39,13 @@ export class LogCollectorService {
 
     private async handleNode(node: NodeConfig) {
         const target = node.static_configs[0].targets[0];
-        const labels = node.static_configs[0].labels;
+        const labels = {
+            ...node.static_configs[0].labels,
+            nodo: node.job_name,
+        };
 
-        // inicializamos la cola
         this.logQueues[target] = [];
+        this.logBuffers[target] = '';
 
         let retries = 0;
 
@@ -49,11 +53,8 @@ export class LogCollectorService {
             const conn = new Client();
 
             conn.on('ready', () => {
-                this.logger.log(`Connected to ${target}`);
-                this.streamLogs(conn, target, labels);
-
-                // iniciar envío periódico de batches
                 this.startFlushInterval(target, labels);
+                this.streamLogs(conn, target, labels);
             });
 
             conn.on('error', (err) => {
@@ -69,11 +70,15 @@ export class LogCollectorService {
                 setTimeout(connect, this.retryDelay);
             });
 
+            conn.on('close', () => {
+                conn.end();
+            });
+
             conn.connect({
                 host: target,
                 port: 22,
                 username: 'root',
-                privateKey: fs.readFileSync(process.env.key!),
+                privateKey: fs.readFileSync('/usr/src/ssh/tpv_rsa.pem'),
             });
         };
 
@@ -81,7 +86,7 @@ export class LogCollectorService {
     }
 
     private startFlushInterval(host: string, labels: Record<string, string>) {
-        if (this.flushIntervals[host]) return; // ya existe
+        if (this.flushIntervals[host]) { clearInterval(this.flushIntervals[host]); }
         this.flushIntervals[host] = setInterval(() => this.flushLogs(host, labels), this.batchInterval);
     }
 
@@ -93,11 +98,16 @@ export class LogCollectorService {
             }
 
             stream.on('data', (data: Buffer) => {
-                const lines = data.toString().split('\n').filter(Boolean);
-                this.logQueues[host].push(...lines);
+                this.logBuffers[host] += data.toString();
+                const lines = this.logBuffers[host].split('\n');
+                this.logBuffers[host] = lines.pop() || '';
 
-                if (this.logQueues[host].length >= this.batchSize) {
-                    this.flushLogs(host, labels);
+                if (lines.length > 0) {
+                    this.logQueues[host].push(...lines);
+
+                    if (this.logQueues[host].length >= this.batchSize) {
+                        this.flushLogs(host, labels);
+                    }
                 }
             });
 
@@ -118,20 +128,21 @@ export class LogCollectorService {
 
         const batch = queue.splice(0, this.batchSize);
 
+        const nowNs = Date.now() * 1_000_000;
+
         const lokiPayload = {
             streams: [
                 {
                     stream: labels,
-                    values: batch.map((line) => [`${Date.now() * 1000000}`, line]),
+                    values: batch.map((line, i) => [`${nowNs + i}`, line]),
                 },
             ],
         };
 
         try {
-            await axios.post('http://localhost:3100/loki/api/v1/push', lokiPayload);
+            await axios.post('http://172.17.0.1:3100/loki/api/v1/push', lokiPayload);
         } catch (err: any) {
             this.logger.error(`Error sending batch to Loki for ${host}: ${err.message}`);
-            // reinsertar batch al inicio de la cola si falla
             this.logQueues[host].unshift(...batch);
         }
     }
