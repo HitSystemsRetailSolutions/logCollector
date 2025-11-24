@@ -50,7 +50,7 @@ export class LogCollectorService implements OnApplicationBootstrap {
         const connect = async () => {
             const canConnect = await this.checkPort(target, 22);
             if (!canConnect) {
-                this.logger.warn(`Node ${target} is offline, retrying in ${this.retryDelay / 1000}s...`);
+                // this.logger.warn(`Node ${target} is offline, retrying in ${this.retryDelay / 1000}s...`);
                 setTimeout(connect, this.retryDelay);
                 return;
             }
@@ -61,6 +61,7 @@ export class LogCollectorService implements OnApplicationBootstrap {
                 this.logger.log(`Connected to ${target}`);
                 this.streamLogs(conn, target, labels);
                 this.startFlushInterval(target, labels);
+                this.startHeartbeat(target, labels);
             });
 
             conn.on('error', err => {
@@ -104,6 +105,24 @@ export class LogCollectorService implements OnApplicationBootstrap {
             socket.connect(port, host);
         });
     }
+    private startHeartbeat(host: string, labels: Record<string, string>) {
+        setInterval(async () => {
+            const heartbeatPayload = {
+                streams: [
+                    {
+                        stream: labels,
+                        values: [[`${Date.now() * 1000000}`, 'heartbeat']]
+                    }
+                ]
+            };
+            try {
+                await axios.post('http://172.17.0.1:3100/loki/api/v1/push', heartbeatPayload);
+            } catch (err: any) {
+                this.logger.error(`Error sending heartbeat for ${host}: ${err.message}`);
+            }
+        }, 60000); // cada 60 segundos, puedes ajustar
+    }
+
 
     private startFlushInterval(host: string, labels: Record<string, string>) {
         if (this.flushIntervals[host]) return;
