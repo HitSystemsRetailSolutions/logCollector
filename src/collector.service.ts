@@ -18,7 +18,7 @@ export class LogCollectorService implements OnApplicationBootstrap {
     private readonly logger = new Logger(LogCollectorService.name);
 
     private readonly maxRetries = 5;
-    private readonly retryDelay = 5000;
+    private readonly retryDelay = 60_000;
     private readonly batchSize = 50;
     private readonly batchInterval = 2000;
 
@@ -50,38 +50,56 @@ export class LogCollectorService implements OnApplicationBootstrap {
         const connect = async () => {
             const canConnect = await this.checkPort(target, 22);
             if (!canConnect) {
-                // this.logger.warn(`Node ${target} is offline, retrying in ${this.retryDelay / 1000}s...`);
-                setTimeout(connect, this.retryDelay);
-                return;
+                this.logger.warn(`Node ${target} offline, retrying in ${this.retryDelay / 1000}s...`);
+                return setTimeout(connect, this.retryDelay);
             }
 
             const conn = new Client();
+            let lastData = Date.now(); // control de actividad
 
             conn.on('ready', () => {
                 this.logger.log(`Connected to ${target}`);
-                this.streamLogs(conn, target, labels);
+                retries = 0;
+
+                this.streamLogs(conn, target, labels, () => {
+                    lastData = Date.now();
+                });
+
                 this.startFlushInterval(target, labels);
-                this.startHeartbeat(target, labels);
+
+                // KEEPALIVE SSH
+                conn.exec('true', () => { });
+                conn.keepaliveInterval = 10000;   // cada 10s
+                conn.keepaliveCountMax = 3;       // si falla 3 veces -> desconectar
             });
 
+            // ERROR = reconectar
             conn.on('error', err => {
                 this.logger.error(`SSH error on ${target}: ${err.message}`);
-                if (retries < this.maxRetries) {
-                    retries++;
-                    setTimeout(connect, this.retryDelay);
-                }
             });
 
-            conn.on('end', () => {
-                this.logger.warn(`SSH connection ended for ${target}, reconnecting...`);
+            // CLOSE = reconectar SIEMPRE
+            conn.on('close', () => {
+                this.logger.warn(`SSH closed for ${target}, reconnecting...`);
                 setTimeout(connect, this.retryDelay);
             });
+
+            // TIMEOUT de inactividad de logs
+            setInterval(() => {
+                if (Date.now() - lastData > 5 * 60 * 1000) { // 5 minutos sin logs
+                    this.logger.warn(`No log activity from ${target} in 5 minutes, forcing reconnect`);
+                    try { conn.end(); } catch { }
+                }
+            }, 5000);
 
             conn.connect({
                 host: target,
                 port: 22,
                 username: 'root',
                 privateKey: fs.readFileSync('/usr/src/ssh/tpv_rsa.pem'),
+                keepaliveInterval: 10000,
+                keepaliveCountMax: 3,
+                readyTimeout: 5000
             });
         };
 
@@ -105,31 +123,18 @@ export class LogCollectorService implements OnApplicationBootstrap {
             socket.connect(port, host);
         });
     }
-    private startHeartbeat(host: string, labels: Record<string, string>) {
-        setInterval(async () => {
-            const heartbeatPayload = {
-                streams: [
-                    {
-                        stream: labels,
-                        values: [[`${Date.now() * 1000000}`, 'heartbeat']]
-                    }
-                ]
-            };
-            try {
-                await axios.post('http://172.17.0.1:3100/loki/api/v1/push', heartbeatPayload);
-            } catch (err: any) {
-                this.logger.error(`Error sending heartbeat for ${host}: ${err.message}`);
-            }
-        }, 60000); // cada 60 segundos, puedes ajustar
-    }
-
 
     private startFlushInterval(host: string, labels: Record<string, string>) {
         if (this.flushIntervals[host]) return;
         this.flushIntervals[host] = setInterval(() => this.flushLogs(host, labels), this.batchInterval);
     }
 
-    private streamLogs(conn: Client, host: string, labels: Record<string, string>) {
+    private streamLogs(
+        conn: Client,
+        host: string,
+        labels: Record<string, string>,
+        onData: () => void
+    ) {
         conn.exec('logread -f', (err, stream: ClientChannel) => {
             if (err) {
                 this.logger.error(`Error executing logread on ${host}: ${err.message}`);
@@ -137,17 +142,20 @@ export class LogCollectorService implements OnApplicationBootstrap {
             }
 
             stream.on('data', (data: Buffer) => {
+                onData();
                 this.logBuffers[host] += data.toString();
                 const lines = this.logBuffers[host].split('\n');
                 this.logBuffers[host] = lines.pop() || '';
                 if (lines.length > 0) this.logQueues[host].push(...lines);
 
-                if (this.logQueues[host].length >= this.batchSize) this.flushLogs(host, labels);
+                if (this.logQueues[host].length >= this.batchSize)
+                    this.flushLogs(host, labels);
             });
 
+            // STREAM CLOSED = reconectar
             stream.on('close', () => {
                 this.logger.warn(`Stream closed for ${host}, reconnecting...`);
-                conn.end();
+                try { conn.end(); } catch { }
             });
 
             stream.stderr.on('data', (err: Buffer) => {
@@ -168,9 +176,9 @@ export class LogCollectorService implements OnApplicationBootstrap {
             streams: [
                 {
                     stream: labels,
-                    values: batch.map((line, i) => [`${nowNs + i}`, line]),
-                },
-            ],
+                    values: batch.map((line, i) => [`${nowNs + i}`, line])
+                }
+            ]
         };
 
         try {
