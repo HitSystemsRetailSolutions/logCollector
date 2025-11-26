@@ -86,8 +86,8 @@ export class LogCollectorService implements OnApplicationBootstrap {
 
             // TIMEOUT de inactividad de logs
             setInterval(() => {
-                if (Date.now() - lastData > 5 * 60 * 1000) { // 5 minutos sin logs
-                    this.logger.warn(`No log activity from ${target} in 5 minutes, forcing reconnect`);
+                if (Date.now() - lastData > 10 * 60 * 1000) { // 10 minutos sin logs
+                    this.logger.warn(`No log activity from ${target} in 10 minutes, forcing reconnect`);
                     try { conn.end(); } catch { }
                 }
             }, 5000);
